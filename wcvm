@@ -1,0 +1,2011 @@
+#!/usr/bin/env python3
+"""wcvm - the WinCraft OS virtual machine of this folder.
+
+Claude Code runs it for you (see CLAUDE.md); it works by hand too.
+
+  ./wcvm doctor                     can this computer run the VM? what is missing?
+  ./wcvm setup [--mem MB] [--cpus N] [--disk GB] [--graphics 3d|basic]
+               [--display window|headless] [--firmware bios|uefi] [--res WxH]
+               [--iso FILE | --version X.Y.Z]
+                                    settings, WinCraft OS download, virtual disk
+  ./wcvm install [--size MIB] [--name LABEL] [--window]
+                                    install WinCraft OS on the blank virtual disk
+  ./wcvm reinstall --yes [...]      erase the virtual disk and install again
+  ./wcvm start [--window|--headless] [--live] [--wait]
+  ./wcvm stop [--force]             shut down (--force: power off at once)
+  ./wcvm restart [--wait]
+  ./wcvm wait [shell|desktop]       until the VM's shell or desktop is up
+  ./wcvm status [--json]
+  ./wcvm screenshot [FILE.png]
+  ./wcvm sh [--user] [--timeout S] COMMAND
+                                    run a command in the VM as root, or as the
+                                    person (--user) with their desktop's settings
+  ./wcvm push FILE GUESTPATH        copy a file into the VM
+  ./wcvm pull GUESTPATH FILE        copy a file out of it
+  ./wcvm type TEXT | key COMBO... | click X Y [right] | dclick X Y | move X Y
+  ./wcvm config [KEY=VALUE ...]     show or change the settings (next start)
+  ./wcvm share                      mount the shared folder now (drive H:)
+  ./wcvm snapshot [list] | save NAME | restore NAME --yes | delete NAME --yes
+  ./wcvm update [check|install|previous]
+                                    WinCraft OS's own updater, in the VM
+  ./wcvm download [--version X.Y.Z] a WinCraft OS ISO, checked by its SHA-256
+  ./wcvm logs [qemu|serial] [-n LINES]
+                                    QEMU's output, or wcvm's shell sessions on the
+                                    serial port (WinCraft starts up on the screen)
+  ./wcvm destroy --yes [--all]      delete the VM (--all: the downloads too)
+
+Everything lives in machine/ beside this file. QEMU is this computer's:
+qemu-system-x86_64 and qemu-img from PATH, or $WCVM_QEMU and $WCVM_QEMU_IMG.
+
+The VM is driven the way WinCraft OS's own development tools (tools/vm and
+tools/qmp.py, github.com/PSthelyBlog/wincraft) drive it: QMP for the screen,
+keyboard and mouse, and a root shell on the serial port, which the guest starts when the host asks for it with an SMBIOS
+OEM string (rc.boot, images newer than 0.6.1).
+"""
+import argparse
+import base64
+import fnmatch
+import glob
+import hashlib
+import json
+import os
+import platform
+import re
+import shlex
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import zlib
+from functools import cached_property
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+APP = os.path.dirname(os.path.realpath(__file__))
+MACHINE = os.path.join(APP, "machine")
+CONFIG = os.path.join(MACHINE, "config.json")
+DISK = os.path.join(MACHINE, "disk.qcow2")
+VARS = os.path.join(MACHINE, "uefi-vars.fd")
+DOWNLOADS = os.path.join(MACHINE, "downloads")
+SHOTS = os.path.join(MACHINE, "screenshots")
+RUN = os.path.join(MACHINE, "run")
+CACHE = os.path.join(MACHINE, "cache")
+
+REPO = "PSthelyBlog/wincraft"
+MIN_QEMU = (6, 2)
+GUEST_DISK = "vda"              # the virtual disk, a virtio block device
+
+# Commands run as the person get the environment of their desktop
+# (/usr/lib/wincraft/desktop). BusyBox's own setpriv lacks these options.
+AS_USER = ("/usr/bin/setpriv --reuid=1000 --regid=1000 --init-groups env -i "
+           "HOME=/home/user USER=user LOGNAME=user PATH=/usr/bin LANG=C.UTF-8 "
+           "DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 WINEPREFIX=/home/user/.wine "
+           "WINEDEBUG=-all WINEDLLOVERRIDES=winemenubuilder.exe=d ")
+
+DEFAULTS = {
+    "mem": 4096, "cpus": 4, "disk_gb": 32, "res": "1280x800",
+    "graphics": "3d", "display": "window", "firmware": "bios",
+    "audio": True, "clipboard": True, "gamepads": False,
+    "share": "", "share_writable": False, "iso": "",
+    "installed": False, "installed_version": "", "snapshots": {},
+}
+
+
+def say(*args):
+    print(*args, flush=True)
+
+
+def die(msg, code=1):
+    print("wcvm: " + msg, file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+def stored_path(path):
+    """PATH relative to this folder when it is inside, so that the folder can move."""
+    rel = os.path.relpath(path, APP)
+    return path if rel.startswith("..") else rel
+
+
+def real_path(path):
+    return path if os.path.isabs(path) else os.path.join(APP, path)
+
+
+# ---------------------------------------------------------------- settings
+
+def _number(lo, hi):
+    def parse(v):
+        if not re.fullmatch(r"\d+", v) or not lo <= int(v) <= hi:
+            raise ValueError("a whole number from %d to %d" % (lo, hi))
+        return int(v)
+    return parse
+
+
+def _choice(*values):
+    def parse(v):
+        if v not in values:
+            raise ValueError(" or ".join(values))
+        return v
+    return parse
+
+
+def _bool(v):
+    if v.lower() in ("on", "yes", "true", "1"):
+        return True
+    if v.lower() in ("off", "no", "false", "0"):
+        return False
+    raise ValueError("on or off")
+
+
+def _res(v):
+    m = re.fullmatch(r"(\d{3,4})x(\d{3,4})", v)
+    if not m or int(m.group(1)) < 800 or int(m.group(2)) < 600:
+        raise ValueError("WIDTHxHEIGHT, at least 800x600")
+    return v
+
+
+def _folder(v):
+    if v == "":
+        return ""
+    path = os.path.realpath(os.path.expanduser(v))
+    if not os.path.isdir(path):
+        raise ValueError("a folder of this computer (no such folder: %s)" % path)
+    return path
+
+
+def _iso(v):
+    path = os.path.realpath(os.path.expanduser(v))
+    if not os.path.isfile(path):
+        raise ValueError("an ISO file (not found: %s)" % path)
+    return stored_path(path)
+
+
+# what `config` shows and changes: description, and how to read a value
+SETTINGS = {
+    "mem": ("memory, in MB", _number(1024, 262144)),
+    "cpus": ("processor cores", _number(1, 128)),
+    "res": ("screen size at start, WIDTHxHEIGHT", _res),
+    "graphics": ("3d: OpenGL and Direct3D drawn by this computer's GPU (virgl); "
+                 "basic: a plain adapter, drawn in software", _choice("3d", "basic")),
+    "display": ("window: on this computer's screen; headless: no window",
+                _choice("window", "headless")),
+    "firmware": ("bios or uefi; an installed system starts with either", _choice("bios", "uefi")),
+    "audio": ("sound through this computer's speakers", _bool),
+    "clipboard": ("copy and paste text between this computer and the VM", _bool),
+    "gamepads": ("hand the game controllers connected at start to the VM", _bool),
+    "share": ("a folder of this computer that the VM sees as drive H: (empty: none)", _folder),
+    "share_writable": ("whether the VM may change the files of the shared folder", _bool),
+    "iso": ("the WinCraft OS ISO to install from, and to start live", _iso),
+}
+
+
+def load_config(required=True):
+    try:
+        with open(CONFIG) as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        if required:
+            die("the VM is not set up yet: ./wcvm doctor, then ./wcvm setup")
+        return None
+    return dict(DEFAULTS, **cfg)
+
+
+def save_config(cfg):
+    os.makedirs(MACHINE, exist_ok=True)
+    with open(CONFIG + ".new", "w") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(CONFIG + ".new", CONFIG)
+
+
+class Lock:
+    """One wcvm at a time on machine/run/NAME.lock."""
+
+    def __init__(self, name):
+        self.path = os.path.join(RUN, name + ".lock")
+
+    def __enter__(self):
+        os.makedirs(RUN, exist_ok=True)
+        self.f = open(self.path, "w")
+        if fcntl:
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        self.f.close()
+
+
+# ---------------------------------------------------------------- this computer
+
+def os_ids():
+    ids = []
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                key, _, value = line.strip().partition("=")
+                if key in ("ID", "ID_LIKE"):
+                    ids += value.strip('"').split()
+    except OSError:
+        pass
+    return ids
+
+
+# The usual packages, by distribution family (os-release ID and ID_LIKE)
+HINTS = {
+    "arch": {"qemu": "sudo pacman -S --needed qemu-desktop",
+             "uefi": "sudo pacman -S --needed edk2-ovmf",
+             "cc": "sudo pacman -S --needed gcc libx11"},
+    "debian": {"qemu": "sudo apt install qemu-system-x86 qemu-system-gui "
+                       "qemu-system-modules-opengl qemu-utils",
+               "uefi": "sudo apt install ovmf",
+               "cc": "sudo apt install gcc libx11-dev"},
+    "fedora": {"qemu": "sudo dnf install qemu-system-x86 qemu-img qemu-ui-gtk "
+                       "qemu-device-display-virtio-vga-gl qemu-audio-pipewire",
+               "uefi": "sudo dnf install edk2-ovmf",
+               "cc": "sudo dnf install gcc libX11-devel"},
+    "suse": {"qemu": "sudo zypper install qemu-x86 qemu-tools qemu-ui-gtk qemu-ui-opengl "
+                     "qemu-hw-display-virtio-vga",
+             "uefi": "sudo zypper install qemu-ovmf-x86_64",
+             "cc": "sudo zypper install gcc libX11-devel"},
+}
+
+
+def hint(what):
+    """The usual command that installs WHAT (qemu, uefi, cc) here, or None."""
+    if platform.system() == "Darwin":
+        return {"qemu": "brew install qemu", "uefi": "brew install qemu"}.get(what)
+    for i in os_ids():
+        if i in HINTS:
+            return HINTS[i][what]
+    return None
+
+
+KNOWN_UEFI = [      # (code, variables template) where distributions put them
+    ("/usr/share/edk2/x64/OVMF_CODE.4m.fd", "/usr/share/edk2/x64/OVMF_VARS.4m.fd"),
+    ("/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"),
+    ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
+    ("/usr/share/edk2/ovmf/OVMF_CODE.fd", "/usr/share/edk2/ovmf/OVMF_VARS.fd"),
+    ("/usr/share/qemu/ovmf-x86_64-4m-code.bin", "/usr/share/qemu/ovmf-x86_64-4m-vars.bin"),
+    ("/opt/homebrew/share/qemu/edk2-x86_64-code.fd", "/opt/homebrew/share/qemu/edk2-i386-vars.fd"),
+    ("/usr/local/share/qemu/edk2-x86_64-code.fd", "/usr/local/share/qemu/edk2-i386-vars.fd"),
+]
+
+
+class Host:
+    """This computer and its QEMU: what they can do, each asked once."""
+
+    def __init__(self):
+        self.system = platform.system()
+        self.qemu = os.environ.get("WCVM_QEMU") or shutil.which("qemu-system-x86_64")
+        self.qemu_img = os.environ.get("WCVM_QEMU_IMG") or shutil.which("qemu-img")
+        self._lists = {}
+
+    def names(self, option):
+        """What QEMU lists for -OPTION help: devices, displays, accelerators..."""
+        if option not in self._lists:
+            text = ""
+            if self.qemu:
+                try:
+                    text = subprocess.run([self.qemu, "-" + option, "help"], stdin=subprocess.DEVNULL,
+                                          capture_output=True, text=True, timeout=60).stdout
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            if option == "device":
+                self._lists[option] = set(re.findall(r'^name "([^"]+)"', text, re.M))
+            else:
+                self._lists[option] = set(line.strip() for line in text.splitlines()[1:] if line.strip())
+        return self._lists[option]
+
+    @cached_property
+    def version(self):
+        try:
+            out = subprocess.run([self.qemu, "--version"], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=60).stdout
+            m = re.search(r"version (\d+)\.(\d+)(?:\.(\d+))?", out)
+            return tuple(int(x or 0) for x in m.groups())
+        except (OSError, subprocess.SubprocessError, AttributeError, TypeError):
+            return None
+
+    @cached_property
+    def accel(self):
+        accels = self.names("accel")
+        if self.system == "Linux" and "kvm" in accels and os.access("/dev/kvm", os.R_OK | os.W_OK):
+            return "kvm"
+        if self.system == "Darwin" and "hvf" in accels and platform.machine() == "x86_64":
+            return "hvf"
+        return "tcg"
+
+    @cached_property
+    def window(self):
+        """QEMU's display for a window on this screen, or None."""
+        displays = self.names("display")
+        if self.system == "Darwin":
+            return "cocoa" if "cocoa" in displays else None
+        if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")):
+            return None
+        return next((d for d in ("gtk", "sdl") if d in displays), None)
+
+    @cached_property
+    def gl_problem(self):
+        """Why the VM cannot have 3D graphics here, or None when it can."""
+        if self.window not in ("gtk", "sdl"):
+            return "it needs a GTK or SDL window"
+        if "virtio-vga-gl" not in self.names("device"):
+            return "QEMU lacks its OpenGL display device (virtio-vga-gl)"
+        if not glob.glob("/dev/dri/renderD*"):
+            return "this computer has no GPU render node (/dev/dri/renderD*)"
+        return None
+
+    @cached_property
+    def audio(self):
+        drivers = self.names("audiodev")
+        if self.system == "Darwin":
+            return "coreaudio" if "coreaudio" in drivers else None
+        runtime = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+        if "pa" in drivers and os.path.exists(os.path.join(runtime, "pulse", "native")):
+            return "pa"
+        if "pipewire" in drivers and os.path.exists(os.path.join(runtime, "pipewire-0")):
+            return "pipewire"
+        return None
+
+    @cached_property
+    def uefi(self):
+        """(code, variables template, format) of a UEFI firmware for a q35
+        machine without Secure Boot, from QEMU's firmware descriptors, or None."""
+        if os.environ.get("WCVM_UEFI_CODE") and os.environ.get("WCVM_UEFI_VARS"):
+            return os.environ["WCVM_UEFI_CODE"], os.environ["WCVM_UEFI_VARS"], "raw"
+        dirs = ["/etc/qemu/firmware", "/usr/share/qemu/firmware",
+                os.path.expanduser("~/.config/qemu/firmware")]
+        if self.qemu:
+            dirs.append(os.path.join(os.path.dirname(os.path.realpath(self.qemu)),
+                                     "..", "share", "qemu", "firmware"))
+        unwanted = {"secure-boot", "requires-smm", "amd-sev", "amd-sev-es", "amd-sev-snp", "intel-tdx"}
+        found = []
+        for d in dirs:
+            for path in glob.glob(os.path.join(d, "*.json")):
+                try:
+                    with open(path) as f:
+                        fw = json.load(f)
+                    m = fw["mapping"]
+                    if ("uefi" not in fw.get("interface-types", []) or m.get("device") != "flash"
+                            or m.get("mode", "split") != "split" or unwanted & set(fw.get("features", []))
+                            or not any(t.get("architecture") == "x86_64" and
+                                       any(fnmatch.fnmatch("pc-q35-9.0", p) for p in t.get("machines", []))
+                                       for t in fw.get("targets", []))):
+                        continue
+                    code, tmpl = m["executable"], m["nvram-template"]
+                    if os.path.isfile(code["filename"]) and os.path.isfile(tmpl["filename"]):
+                        found.append((os.path.basename(path), code["filename"], tmpl["filename"],
+                                      code.get("format", "raw")))
+                except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                    continue
+        if found:
+            return min(found)[1:]           # descriptors rank themselves by name
+        for code, tmpl in KNOWN_UEFI:
+            if os.path.isfile(code) and os.path.isfile(tmpl):
+                return code, tmpl, "raw"
+        return None
+
+
+def host_memory_mb():
+    try:
+        if platform.system() == "Darwin":
+            return int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True,
+                                      text=True).stdout) // 1048576
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def recommended():
+    mem, cpus = host_memory_mb() or 8192, os.cpu_count() or 2
+    return {"mem": 8192 if mem >= 24576 else 4096 if mem >= 8192 else 3072 if mem >= 6144 else 2048,
+            "cpus": max(1, min(4, cpus // 2)), "disk_gb": 32}
+
+
+def kvm_advice():
+    """(what is wrong, how to fix it) when the VM has no hardware virtualisation."""
+    if platform.system() == "Darwin":
+        return ("not available on this Mac: the VM's processor is emulated, many times slower", None)
+    if not os.path.exists("/dev/kvm"):
+        return ("/dev/kvm is missing: the VM would run many times slower",
+                "turn on virtualisation (Intel VT-x, or AMD-V/SVM) in this computer's firmware "
+                "settings; inside another virtual machine, enable nested virtualisation")
+    if not os.access("/dev/kvm", os.R_OK | os.W_OK):
+        try:
+            import grp
+            group = grp.getgrgid(os.stat("/dev/kvm").st_gid).gr_name
+        except (ImportError, KeyError, OSError):
+            group = "kvm"
+        return ("/dev/kvm is there, but you may not use it: the VM would run many times slower",
+                "sudo usermod -aG %s $USER, then log out and back in" % group)
+    return ("QEMU has no KVM support", hint("qemu"))
+
+
+# ---------------------------------------------------------------- releases
+
+def http_get(url, accept="application/vnd.github+json", timeout=30):
+    return urllib.request.urlopen(urllib.request.Request(
+        url, headers={"User-Agent": "wincraft-vm", "Accept": accept}), timeout=timeout)
+
+
+def github_release(version=None):
+    url = "https://api.github.com/repos/%s/releases/%s" % (REPO, "tags/v" + version if version else "latest")
+    with http_get(url, timeout=15) as r:
+        return json.load(r)
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def iso_version(path):
+    m = re.search(r"wincraft-(\d+(?:\.\d+)+)-x86_64\.iso$", os.path.basename(path or ""))
+    return m.group(1) if m else ""
+
+
+def download(version=None):
+    """Fetch a release's ISO into machine/downloads, checked against the
+    SHA-256 published with it; return (path, version)."""
+    try:
+        rel = github_release(version)
+    except urllib.error.HTTPError as e:
+        die("GitHub has no WinCraft OS release %s (%s)" % (version, e.code) if e.code == 404 and version
+            else "GitHub answered %s %s" % (e.code, e.reason))
+    except (urllib.error.URLError, OSError) as e:
+        die("GitHub could not be reached: %s" % getattr(e, "reason", e))
+    ver = rel["tag_name"].lstrip("v")
+    name = "wincraft-%s-x86_64.iso" % ver
+    assets = {a["name"]: a for a in rel.get("assets", [])}
+    if name not in assets or name + ".sha256" not in assets:
+        die("release %s has no %s with its checksum" % (ver, name))
+    os.makedirs(DOWNLOADS, exist_ok=True)
+    dest = os.path.join(DOWNLOADS, name)
+    try:
+        with http_get(assets[name + ".sha256"]["browser_download_url"], "application/octet-stream") as r:
+            expected = r.read().decode().split()[0].lower()
+        if os.path.exists(dest) and sha256_file(dest) == expected:
+            say("WinCraft OS %s is downloaded already, and checked (%s)." % (ver, stored_path(dest)))
+            return dest, ver
+        size = assets[name]["size"]
+        say("Downloading WinCraft OS %s (%d MB) from github.com/%s..." % (ver, size // 1048576, REPO))
+        h, got, shown = hashlib.sha256(), 0, 0
+        with http_get(assets[name]["browser_download_url"], "application/octet-stream", 60) as r, \
+                open(dest + ".part", "wb") as f:
+            for chunk in iter(lambda: r.read(1 << 20), b""):
+                f.write(chunk)
+                h.update(chunk)
+                got += len(chunk)
+                if got - shown >= size / 10:
+                    say("  %d of %d MB" % (got // 1048576, size // 1048576))
+                    shown = got
+    except (urllib.error.URLError, OSError) as e:
+        die("the download failed: %s. Run it again, or download %s by hand and use "
+            "./wcvm setup --iso FILE" % (getattr(e, "reason", e), name))
+    if h.hexdigest() != expected:
+        os.unlink(dest + ".part")
+        die("the download does not match the SHA-256 published with it, and was deleted. "
+            "Try again; if it happens again, do not use it")
+    os.replace(dest + ".part", dest)
+    say("It matches the SHA-256 published with it (%s)." % expected)
+    return dest, ver
+
+
+# ---------------------------------------------------------------- QEMU
+
+def sock_dir():
+    """Where QEMU's sockets go: machine/run, unless that path is too long for
+    a Unix socket (108 bytes on Linux, 104 on macOS)."""
+    if len(os.path.join(RUN, "serial.sock")) < 100:
+        return RUN
+    d = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp",
+                     "wcvm-%d-%s" % (os.getuid(), hashlib.sha1(APP.encode()).hexdigest()[:10]))
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return d
+
+
+def sock(name):
+    return os.path.join(sock_dir(), name)
+
+
+def opt(value):
+    """A file name inside a QEMU option, where a comma is written twice."""
+    return value.replace(",", ",,")
+
+
+def qemu_args(cfg, host, display, live, disk=True):
+    """QEMU's command line, and whether the VM gets 3D graphics."""
+    width, height = cfg["res"].split("x")
+    args = [host.qemu, "-name", "WinCraft OS", "-machine", "q35",
+            "-m", str(cfg["mem"]), "-smp", str(cfg["cpus"])]
+    if host.accel == "tcg":
+        args += ["-accel", "tcg,thread=multi,tb-size=1024", "-cpu", "max"]
+    else:
+        args += ["-accel", host.accel, "-cpu", "host"]
+
+    gl = display == "window" and cfg["graphics"] == "3d" and host.gl_problem is None
+    args += ["-device", "%s,xres=%s,yres=%s" % ("virtio-vga-gl" if gl else "VGA", width, height),
+             "-device", "qemu-xhci", "-device", "usb-tablet", "-device", "usb-kbd",
+             "-nic", "user,model=virtio-net-pci", "-rtc", "base=utc",
+             "-qmp", "unix:%s,server=on,wait=off" % opt(sock("qmp.sock")),
+             "-chardev", "socket,id=ser0,path=%s,server=on,wait=off,logfile=%s"
+             % (opt(sock("serial.sock")), opt(os.path.join(RUN, "serial.log"))),
+             "-serial", "chardev:ser0",
+             "-device", "virtio-serial-pci",
+             # root shells on the serial port and Ctrl+Alt+F2 (rc.boot), and a
+             # fast channel for screenshots and files, where the serial port
+             # would stall the guest
+             "-smbios", "type=11,value=wincraft.shell",
+             "-chardev", "socket,id=wcout,path=%s,server=on,wait=off" % opt(sock("out.sock")),
+             "-device", "virtserialport,chardev=wcout,name=org.wincraft.out"]
+    if cfg["clipboard"] and "qemu-vdagent" in host.names("chardev"):
+        # text only, kept in step by the guest's wcclip
+        args += ["-chardev", "qemu-vdagent,id=vdagent,clipboard=on,mouse=off",
+                 "-device", "virtserialport,chardev=vdagent,name=com.redhat.spice.0"]
+
+    if cfg["firmware"] == "uefi":
+        if not host.uefi:
+            die("no UEFI firmware for QEMU on this computer (%s), or ./wcvm config firmware=bios"
+                % (hint("uefi") or "install OVMF"))
+        code, template, fmt = host.uefi
+        if not os.path.exists(VARS):
+            shutil.copyfile(template, VARS)
+        args += ["-drive", "if=pflash,format=%s,readonly=on,file=%s" % (fmt, opt(code)),
+                 "-drive", "if=pflash,format=%s,file=%s" % (fmt, opt(VARS))]
+
+    # live: from the ISO, with the disk beside it to install on, if any
+    if live:
+        args += ["-drive", "file=%s,media=cdrom,readonly=on,if=none,id=cd0" % opt(real_path(cfg["iso"])),
+                 "-device", "ide-cd,drive=cd0,bootindex=1"]
+    if disk:
+        args += ["-drive", "file=%s,format=qcow2,if=none,id=hd0" % opt(DISK),
+                 "-device", "virtio-blk-pci,drive=hd0,bootindex=2"]
+
+    if cfg["share"]:
+        if not os.path.isdir(cfg["share"]):
+            say("The shared folder %s is missing: the VM starts without it." % cfg["share"])
+        elif "virtio-9p-pci" not in host.names("device"):
+            say("This QEMU cannot share folders (no virtio-9p-pci): the VM starts without one.")
+        else:
+            args += ["-virtfs", "local,path=%s,mount_tag=host,security_model=none%s"
+                     % (opt(cfg["share"]), "" if cfg["share_writable"] else ",readonly=on")]
+
+    # Game controllers: their input devices, forwarded with the same name and
+    # USB ids so that Wine recognises them (an Xbox controller becomes an
+    # XInput gamepad). Needs read-write access to /dev/input/eventN, which
+    # desktops grant the logged-in user for joysticks.
+    if cfg["gamepads"] and host.system == "Linux":
+        for pad in glob.glob("/dev/input/by-id/*-event-joystick"):
+            dev = os.path.realpath(pad)
+            if os.access(dev, os.R_OK | os.W_OK):
+                args += ["-device", "virtio-input-host-pci,evdev=%s" % opt(dev)]
+                say("Game controller %s: handed to the VM." % os.path.basename(pad))
+            else:
+                say("Game controller %s: no access to %s, not handed over." % (os.path.basename(pad), dev))
+
+    if display == "window":
+        if host.window == "gtk":
+            # QEMU 8.1 made the GTK clipboard an option, off by default
+            clip = ",clipboard=on" if cfg["clipboard"] and host.version >= (8, 1) else ""
+            args += ["-display", "gtk,gl=%s,zoom-to-fit=on%s" % ("on" if gl else "off", clip)]
+        elif host.window == "sdl":
+            args += ["-display", "sdl,gl=%s" % ("on" if gl else "off")]
+        else:
+            args += ["-display", host.window]
+    else:
+        args += ["-display", "none"]
+    audio = host.audio if display == "window" and cfg["audio"] else None
+    args += ["-audiodev", "%s,id=snd0" % (audio or "none"),
+             "-device", "intel-hda", "-device", "hda-output,audiodev=snd0"]
+    return args, gl
+
+
+def cmdline(pid):
+    if os.path.isdir("/proc/self"):
+        try:
+            with open("/proc/%d/cmdline" % pid, "rb") as f:
+                return f.read().replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            return ""
+    try:
+        return subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                              capture_output=True, text=True).stdout
+    except OSError:
+        return ""
+
+
+def vm_pid():
+    """The running VM's QEMU process, or None."""
+    try:
+        with open(os.path.join(RUN, "qemu.pid")) as f:
+            pid = int(f.read())
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        return None
+    # The number may belong to another process by now: ours names this
+    # folder's qmp.sock on its command line (and a zombie's is empty).
+    return pid if opt(sock("qmp.sock")) in cmdline(pid) else None
+
+
+def run_state():
+    try:
+        with open(os.path.join(RUN, "state.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def tail(path, lines=20):
+    try:
+        with open(path, errors="replace") as f:
+            return "".join(f.readlines()[-lines:])
+    except OSError:
+        return ""
+
+
+def launch(cfg, host, display, live, disk=True):
+    """Start QEMU in the background; return its process once QMP answers."""
+    os.makedirs(RUN, exist_ok=True)
+    for name in ("qmp.sock", "serial.sock", "out.sock"):
+        try:
+            os.unlink(sock(name))
+        except FileNotFoundError:
+            pass
+    args, gl = qemu_args(cfg, host, display, live, disk)
+    log_path = os.path.join(RUN, "qemu.log")
+    with open(log_path, "w") as log:
+        log.write("# %s\n# %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), " ".join(shlex.quote(a) for a in args)))
+        log.flush()
+        # a session of its own, and no terminal: it outlives this command
+        p = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                             cwd=MACHINE, start_new_session=True)
+    with open(os.path.join(RUN, "qemu.pid"), "w") as f:
+        f.write("%d\n" % p.pid)
+    with open(os.path.join(RUN, "state.json"), "w") as f:
+        json.dump({"display": display, "live": live, "disk": disk, "graphics": "3d" if gl else "basic",
+                   "accel": host.accel, "started": time.time()}, f)
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if p.poll() is not None:
+            die("QEMU stopped as it started:\n" + tail(log_path, 15))
+        try:
+            QMP(timeout=2).close()
+            return p
+        except (OSError, ValueError):
+            time.sleep(0.3)
+    p.kill()
+    die("QEMU did not answer within a minute:\n" + tail(log_path, 15))
+
+
+def wait_gone(pid, timeout):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if vm_pid() != pid:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def boot_timeout(host):
+    return 1500 if host.accel == "tcg" else 300
+
+
+class QMP:
+    def __init__(self, timeout=10):
+        self.s = socket.socket(socket.AF_UNIX)
+        self.s.settimeout(timeout)
+        try:
+            self.s.connect(sock("qmp.sock"))
+            self.f = self.s.makefile("rw")
+            self.f.readline()               # the greeting
+            self.cmd("qmp_capabilities")
+        except (OSError, ValueError):
+            self.s.close()
+            raise
+
+    def cmd(self, name, **args):
+        msg = {"execute": name}
+        if args:
+            msg["arguments"] = args
+        self.f.write(json.dumps(msg) + "\n")
+        self.f.flush()
+        while True:
+            line = self.f.readline()
+            if not line:
+                raise OSError("QEMU closed its QMP connection")
+            reply = json.loads(line)
+            if "return" in reply or "error" in reply:
+                return reply
+
+    def close(self):
+        self.s.close()
+
+
+# ---------------------------------------------------------------- the guest
+
+def serial_sh(command, timeout=60, interrupt=False):
+    """Run COMMAND in the VM's serial root shell: (output, finished, status).
+    Echo is switched off, so that only real output lies between two markers;
+    the markers as typed are followed by other characters than the output's.
+    INTERRUPT: send Ctrl+C when the time is up."""
+    tag = os.urandom(4).hex()
+    begin, end = "WCB" + tag, "WCE" + tag
+    pattern = re.compile(begin + r"\n(.*?)" + end + r"(\d+)", re.S)
+
+    def text(buf):      # without carriage returns and colours (BusyBox ls)
+        return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", buf.decode(errors="replace").replace("\r", ""))
+    with Lock("serial"):
+        s = socket.socket(socket.AF_UNIX)
+        s.settimeout(1.0)
+        try:
+            s.connect(sock("serial.sock"))
+        except OSError:
+            return "", False, None
+        try:
+            s.sendall(("\nstty -echo 2>/dev/null; echo %s; ( %s ) </dev/null; echo %s$?\n"
+                       % (begin, command, end)).encode())
+            buf = b""
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                try:
+                    chunk = s.recv(65536)
+                except socket.timeout:
+                    continue
+                if not chunk:
+                    break
+                buf += chunk
+                m = pattern.search(text(buf))
+                if m:
+                    return m.group(1).rstrip("\n"), True, int(m.group(2))
+            if interrupt:
+                s.sendall(b"\x03")
+            out = text(buf)
+            return out.split(begin + "\n", 1)[1] if begin + "\n" in out else "", False, None
+        except OSError:
+            return "", False, None
+        finally:
+            s.close()
+
+
+def guest_run(command, timeout=60, interrupt=False):
+    """serial_sh for any command. The shell reads a line at a time, of at
+    most 4095 characters: a long command, one of several lines or one with a
+    comment goes to the VM as a script first."""
+    if len(command) < 800 and "\n" not in command and "#" not in command:
+        return serial_sh(command, timeout, interrupt)
+    data = base64.b64encode(command.encode()).decode()
+    script = "/run/wcvm-%s" % os.urandom(4).hex()
+    for i in range(0, len(data), 800):
+        out, ok, _ = serial_sh("printf %%s %s >> %s.b64" % (data[i:i + 800], script), 15)
+        if not ok:
+            return out, False, None
+    return serial_sh("base64 -d %s.b64 > %s; rm -f %s.b64; sh %s; s=$?; rm -f %s; exit $s"
+                     % ((script,) * 5), timeout, interrupt)
+
+
+def shell_up():
+    out, ok, _ = serial_sh("echo up", 5)
+    return ok and out.strip() == "up"
+
+
+def desktop_up():
+    out, ok, _ = serial_sh("pidof wcshell.exe >/dev/null && DISPLAY=:0 xrandr >/dev/null 2>&1 && echo up", 10)
+    return ok and out.strip() == "up"
+
+
+def wait_for(check, timeout, p=None):
+    """Until CHECK() is true; False when the VM stops, or after TIMEOUT."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if (p.poll() is not None) if p else not vm_pid():
+            return False
+        if check():
+            return True
+        time.sleep(2)
+    return False
+
+
+GUEST_INFO = ("echo version=$(cat /etc/wincraft/version 2>/dev/null); "
+              "[ -e /run/wincraft/live ] && echo session=live || echo session=installed; "
+              "pidof wcshell.exe >/dev/null && echo desktop=yes || echo desktop=no; "
+              "echo ip=$(ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}'); "
+              "echo uptime=$(cut -d. -f1 /proc/uptime)")
+
+
+def guest_info(timeout=5):
+    out, ok, _ = serial_sh(GUEST_INFO, timeout)
+    if not ok:
+        return None
+    return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+
+
+def remember(cfg, info):
+    """An installed system running from the disk: say so in the settings
+    (also after the person installed it with the installer window)."""
+    if info and info.get("session") == "installed" and info.get("version") and \
+            (not cfg["installed"] or cfg["installed_version"] != info["version"]):
+        cfg.update(installed=True, installed_version=info["version"])
+        save_config(cfg)
+
+
+def guest_request(helper, args, timeout, show=True):
+    """Ask wcinit for one of WinCraft's privileged helpers, the way its
+    windows do, with a request of our own; print its progress lines; return
+    them all once the last one says how it ended."""
+    req = os.urandom(8).hex()
+    out, ok, status = serial_sh("/usr/bin/wcctl priv %s request=%s %s" % (helper, req, args), 15)
+    if not ok or status:
+        die("WinCraft OS's system service could not be asked: %s" % out.strip())
+    start, shown = time.time(), 0
+    while time.time() - start < timeout:
+        time.sleep(2)
+        out, ok, status = serial_sh("cat /run/wincraft/requests/%s" % req, 15)
+        if not ok or status:
+            if time.time() - start > 15:
+                die("WinCraft OS's system service did not respond")
+            continue
+        lines = out.splitlines()
+        if show and len(lines) > shown:
+            new = lines[shown:]
+            # of the download's progress lines, the newest is enough
+            for i, line in enumerate(new):
+                if not (re.search(r": \d+ of \d+ MB$", line) and i < len(new) - 1):
+                    say("  " + line)
+        shown = len(lines)
+        if lines and (lines[-1] in ("done", "checked") or lines[-1].startswith("error: ")):
+            return lines
+    die("the %s helper did not finish within %d seconds" % (helper, timeout))
+
+
+def guest_path(path):
+    """A path in the VM; Windows paths (C:\\..., Z:\\..., H:\\...) are turned into the Linux ones."""
+    m = re.match(r"^([A-Za-z]):[\\/]?(.*)$", path)
+    if not m:
+        return path
+    root = {"c": "/home/user/.wine/drive_c", "z": "", "h": "/mnt/host"}.get(m.group(1).lower())
+    if root is None:
+        die("drive %s: is not one wcvm knows (C:, Z: or H:)" % m.group(1))
+    return root + "/" + m.group(2).replace("\\", "/")
+
+
+# The guest's end of out.sock, found by the port's name
+GUEST_PORT = ('for p in /sys/class/virtio-ports/*; do '
+              '[ "$(cat $p/name 2>/dev/null)" = org.wincraft.out ] && port=/dev/${p##*/}; done; ')
+
+
+def channel_state(q):
+    """out.sock as QEMU sees it: whether it took our connection, and whether
+    the guest has its end open."""
+    port = [c for c in q.cmd("query-chardev")["return"] if c["label"] == "wcout"]
+    if not port:
+        die("the VM was started without its file channel: restart it (./wcvm restart)")
+    return not port[0]["filename"].startswith("disconnected"), bool(port[0].get("frontend-open"))
+
+
+def channel_connect(q):
+    """Connect to out.sock and wait until QEMU has taken the connection: the
+    guest reads end of file until then, and its writes are lost. Q: our QMP
+    connection, as QEMU takes one at a time."""
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(sock("out.sock"))
+    for _ in range(100):
+        if channel_state(q)[0]:
+            break
+        time.sleep(0.05)
+    return s
+
+
+def channel_read(q, command, size=None, sink=None, timeout=600):
+    """Run COMMAND in the VM with its output going to out.sock: SIZE bytes,
+    written to SINK, or else a whole PPM image, returned."""
+    s = channel_connect(q)
+    s.settimeout(timeout)
+    got = {"data": bytearray(), "n": 0}
+
+    def reader():
+        need = size
+        while need is None or got["n"] < need:
+            try:
+                chunk = s.recv(1 << 20)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            got["n"] += len(chunk)
+            if sink:
+                sink.write(chunk)
+                continue
+            buf = got["data"]
+            buf += chunk
+            if need is None and buf.count(b"\n") >= 3:
+                head = bytes(buf).split(b"\n", 3)
+                w, h = map(int, head[1].split())
+                need = len(buf) - len(head[3]) + w * h * 3
+
+    t = threading.Thread(target=reader)
+    t.start()
+    serial_sh(GUEST_PORT + command + ' > "$port"', timeout)
+    t.join()
+    s.close()
+    return got["n"] if sink else bytes(got["data"])
+
+
+def channel_write(q, path, command, timeout=600):
+    """Send the file PATH to COMMAND's standard input in the VM; return
+    COMMAND's exit status, or None."""
+    tag = os.urandom(4).hex()
+    s = channel_connect(q)
+    try:
+        serial_sh("kill $(cat /run/wcvm-channel.pid 2>/dev/null) 2>/dev/null; " + GUEST_PORT +
+                  '( (%s) < "$port"; echo $? > /run/wcvm-%s.done ) >/dev/null 2>&1 & echo $! > /run/wcvm-channel.pid'
+                  % (command, tag), 10)
+        for _ in range(200):            # QEMU drops what arrives before the guest opens its end
+            if channel_state(q)[1]:
+                break
+            time.sleep(0.05)
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                s.sendall(chunk)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            out, ok, _ = serial_sh("cat /run/wcvm-%s.done 2>/dev/null" % tag, 10)
+            if ok and out.strip().isdigit():
+                return int(out.strip())
+            time.sleep(0.3)
+        return None
+    finally:
+        s.close()
+        serial_sh("rm -f /run/wcvm-%s.done /run/wcvm-channel.pid" % tag, 10)
+
+
+def write_png(path, width, height, rgb):
+    raw = b"".join(b"\0" + rgb[y * width * 3:(y + 1) * width * 3] for y in range(height))
+
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data +
+                struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff))
+
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" +
+                chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) +
+                chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+def png_size(path):
+    with open(path, "rb") as f:
+        return struct.unpack(">II", f.read(24)[16:24])
+
+
+def ppm_to_png(ppm, path):
+    try:
+        _, dims, _, rgb = ppm.split(b"\n", 3)
+        width, height = map(int, dims.split())
+        if len(rgb) < width * height * 3:
+            raise ValueError("short")
+    except ValueError:
+        die("no screenshot: the VM sent %d bytes" % len(ppm))
+    write_png(path, width, height, rgb)
+
+
+def xshot_binary():
+    """The guest's screenshot program, xshot.c beside this file, compiled on
+    this computer since the guest has no compiler; it reads the screen from
+    the guest's X server, where QEMU cannot read a 3D display."""
+    src, out = os.path.join(APP, "xshot.c"), os.path.join(CACHE, "xshot")
+    if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(src):
+        return out
+    cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+    if platform.system() != "Linux" or platform.machine() != "x86_64" or not cc:
+        die("with 3D graphics, a screenshot needs a C compiler for x86-64 Linux on this computer "
+            "(%s); or ./wcvm config graphics=basic, then restart" % (hint("cc") or "gcc and the X11 headers"))
+    os.makedirs(CACHE, exist_ok=True)
+    r = subprocess.run([cc, "-O2", "-o", out, src, "-lX11"], capture_output=True, text=True)
+    if r.returncode:
+        die("could not build the screenshot program (%s needs the X11 headers: %s):\n%s"
+            % (cc, hint("cc") or "libX11's development files", r.stderr.strip()[-500:]))
+    return out
+
+
+def guest_shot(q, path):
+    out, ok, _ = serial_sh("test -x /run/wcvm-xshot && echo present", 10)
+    if not ok:
+        die("no screenshot: the VM's shell does not answer")
+    if "present" not in out:
+        binary = xshot_binary()
+        size = os.path.getsize(binary)
+        # BusyBox head exits with 1 here even when it got everything: check the size
+        channel_write(q, binary, "head -c %d > /run/wcvm-xshot.new; [ $(stat -c %%s /run/wcvm-xshot.new) = %d ] && "
+                                 "chmod 755 /run/wcvm-xshot.new && mv /run/wcvm-xshot.new /run/wcvm-xshot"
+                                 % (size, size), 30)
+    ppm_to_png(channel_read(q, "/run/wcvm-xshot", timeout=60), path)
+
+
+def take_screenshot(q, path):
+    r = q.cmd("screendump", filename=path, format="png")
+    if "error" in r and "format" in r["error"]["desc"]:         # before QEMU 7.1: PPM only
+        r = q.cmd("screendump", filename=path + ".ppm")
+        if "error" not in r:
+            with open(path + ".ppm", "rb") as f:
+                ppm_to_png(f.read(), path)
+            os.unlink(path + ".ppm")
+    if "error" in r:
+        if r["error"]["desc"] != "no surface":
+            die("no screenshot: " + r["error"]["desc"])
+        guest_shot(q, path)                 # a 3D display: ask the guest's X server
+
+
+def screen_size(q):
+    tmp = os.path.join(RUN, "size.png")
+    if "error" not in q.cmd("screendump", filename=tmp, format="png"):
+        size = png_size(tmp)
+        os.unlink(tmp)
+        return size
+    out, _, _ = serial_sh("DISPLAY=:0 xrandr 2>/dev/null | "
+                          "sed -n 's/.* current \\([0-9]*\\) x \\([0-9]*\\),.*/\\1 \\2/p'", 10)
+    try:
+        w, h = out.split()[:2]
+        return int(w), int(h)
+    except ValueError:
+        die("cannot tell the VM's screen size")
+
+
+KEYS = {
+    " ": "spc", "\n": "ret", "\t": "tab", "-": "minus", "=": "equal",
+    "[": "bracket_left", "]": "bracket_right", ";": "semicolon",
+    "'": "apostrophe", "`": "grave_accent", "\\": "backslash", ",": "comma",
+    ".": "dot", "/": "slash",
+}
+SHIFTED = {
+    "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7",
+    "*": "8", "(": "9", ")": "0", "_": "minus", "+": "equal",
+    "{": "bracket_left", "}": "bracket_right", ":": "semicolon",
+    '"': "apostrophe", "~": "grave_accent", "|": "backslash", "<": "comma",
+    ">": "dot", "?": "slash",
+}
+
+
+def press(q, combo, hold=60):
+    names = combo.split("-") if len(combo) > 1 else [combo]
+    r = q.cmd("send-key", keys=[{"type": "qcode", "data": k} for k in names], **{"hold-time": hold})
+    if "error" in r:
+        die("%s: %s (key names are QEMU's: ret, esc, tab, spc, ctrl, alt, shift, meta_l, f1, a...)"
+            % (combo, r["error"]["desc"]))
+    time.sleep(hold / 1000 + 0.05)
+
+
+def type_text(q, text):
+    for ch in text:
+        if ch in KEYS:
+            press(q, KEYS[ch])
+        elif ch in SHIFTED:
+            press(q, "shift-" + SHIFTED[ch])
+        elif ch.isascii() and ch.isupper():
+            press(q, "shift-" + ch.lower())
+        elif ch.isascii() and ch.isalnum():
+            press(q, ch)
+        else:
+            die("cannot type %r: only ASCII characters (the VM's keyboard is US)" % ch)
+    # QEMU queues the keys faster than the guest takes them: let them arrive
+    time.sleep(min(3, 0.05 * len(text)))
+
+
+def pointer(q, x, y):
+    w, h = screen_size(q)
+    q.cmd("input-send-event", events=[
+        {"type": "abs", "data": {"axis": "x", "value": int(x * 32767 / (w - 1))}},
+        {"type": "abs", "data": {"axis": "y", "value": int(y * 32767 / (h - 1))}}])
+    time.sleep(0.15)
+
+
+def click(q, x, y, button="left", count=1):
+    pointer(q, x, y)
+    for _ in range(count):
+        for down in (True, False):
+            q.cmd("input-send-event", events=[{"type": "btn", "data": {"down": down, "button": button}}])
+            time.sleep(0.08)
+
+
+def mount_share(cfg):
+    """The shared folder at /mnt/host in the VM, and as drive H: of the person's Windows."""
+    out, ok, status = serial_sh(
+        "mkdir -p /mnt/host && { mountpoint -q /mnt/host || "
+        "mount -t 9p -o trans=virtio,version=9p2000.L%s host /mnt/host; } && "
+        "%sln -sfn /mnt/host /home/user/.wine/dosdevices/h:"
+        % ("" if cfg["share_writable"] else ",ro", AS_USER), 20)
+    if not ok or status:
+        say("The shared folder could not be mounted: %s" % out.strip())
+        return False
+    say("Shared folder: %s is drive H: in the VM (%s)."
+        % (cfg["share"], "it may change it" if cfg["share_writable"] else "read only"))
+    return True
+
+
+# ---------------------------------------------------------------- commands
+
+def need_qemu(host=None):
+    host = host or Host()
+    if not host.qemu or not host.qemu_img:
+        die("QEMU is not installed on this computer: ./wcvm doctor says what to install")
+    if not host.version or host.version < MIN_QEMU:
+        die("QEMU %s is too old: %d.%d or newer is needed" % (".".join(map(str, host.version or ())), *MIN_QEMU))
+    return host
+
+
+def need_running():
+    pid = vm_pid()
+    if not pid:
+        die("the VM is not running: ./wcvm start")
+    return pid
+
+
+def need_stopped():
+    if vm_pid():
+        die("the VM is running: stop it first (./wcvm stop)")
+
+
+def need_shell(timeout=30):
+    need_running()
+    if not wait_for(shell_up, timeout):
+        die("the VM's shell does not answer (still starting? ./wcvm wait shell)")
+
+
+def need_iso(cfg):
+    if not cfg["iso"] or not os.path.isfile(real_path(cfg["iso"])):
+        die("no WinCraft OS ISO: ./wcvm download")
+    return real_path(cfg["iso"])
+
+
+def create_disk(cfg, host):
+    os.makedirs(MACHINE, exist_ok=True)
+    r = subprocess.run([host.qemu_img, "create", "-q", "-f", "qcow2", DISK, "%dG" % cfg["disk_gb"]],
+                       capture_output=True, text=True)
+    if r.returncode:
+        die("could not create the virtual disk: " + r.stderr.strip())
+
+
+def checks(host, online=True):
+    """doctor's findings: dicts of level (ok, warn, fail, info), what, detail, fix."""
+    found = []
+
+    def add(level, what, detail, fix=None):
+        found.append({"level": level, "what": what, "detail": detail, "fix": fix})
+
+    if host.system not in ("Linux", "Darwin"):
+        add("fail", "Operating system", "%s is not supported: WinCraft VM runs on Linux "
+            "(and, untested, on macOS)" % host.system)
+    if platform.machine().lower() not in ("x86_64", "amd64"):
+        add("warn", "Processor", "%s: the VM's x86-64 processor is emulated, many times slower"
+            % platform.machine())
+    vs = ".".join(map(str, host.version or ()))
+    if not host.qemu:
+        add("fail", "QEMU", "not installed (qemu-system-x86_64)", hint("qemu"))
+    elif not host.version or host.version < MIN_QEMU:
+        add("fail", "QEMU", "version %s is too old: %d.%d or newer is needed" % (vs or "?", *MIN_QEMU),
+            hint("qemu"))
+    else:
+        missing = [d for d in ("virtio-net-pci", "virtio-blk-pci", "virtio-serial-pci", "qemu-xhci",
+                               "usb-tablet", "VGA", "intel-hda", "ide-cd") if d not in host.names("device")]
+        if missing:
+            add("fail", "QEMU", "%s lacks devices the VM needs: %s" % (vs, ", ".join(missing)), hint("qemu"))
+        else:
+            add("ok", "QEMU", "%s (%s)" % (vs, host.qemu))
+    if not host.qemu_img:
+        add("fail", "qemu-img", "not installed", hint("qemu"))
+    if host.qemu and host.version:
+        if host.accel != "tcg":
+            add("ok", "Hardware virtualisation", {"kvm": "KVM", "hvf": "Hypervisor.framework"}[host.accel])
+        else:
+            add("warn", "Hardware virtualisation", *kvm_advice())
+        if host.window:
+            add("ok", "Window", "QEMU's %s display" % host.window.upper())
+        elif host.system == "Linux" and not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")):
+            add("warn", "Window", "no graphical session here (no WAYLAND_DISPLAY or DISPLAY): "
+                "the VM can only run without a window")
+        else:
+            add("warn", "Window", "QEMU has no GTK or SDL display: the VM can only run without a window",
+                hint("qemu"))
+        if host.gl_problem is None:
+            add("ok", "3D graphics", "virgl: the VM's OpenGL and Direct3D are drawn by this computer's GPU")
+        else:
+            add("warn", "3D graphics", "not available, %s: the VM draws in software, fine for "
+                "applications, slow for 3D games" % host.gl_problem,
+                hint("qemu") if "QEMU" in host.gl_problem else None)
+        if host.audio:
+            add("ok", "Sound", "through %s" % {"pa": "PulseAudio", "pipewire": "PipeWire",
+                                              "coreaudio": "Core Audio"}[host.audio])
+        else:
+            add("info", "Sound", "no sound server QEMU can use: the VM is silent")
+        if "qemu-vdagent" in host.names("chardev"):
+            add("ok", "Clipboard", "text is copied and pasted between this computer and the VM")
+        else:
+            add("info", "Clipboard", "QEMU cannot share the clipboard (no qemu-vdagent)")
+        if host.uefi:
+            add("ok", "UEFI firmware", host.uefi[0])
+        else:
+            add("info", "UEFI firmware", "not found; optional, the VM starts with BIOS", hint("uefi"))
+    free = shutil.disk_usage(APP).free
+    add("ok" if free >= 12e9 else "warn" if free >= 3e9 else "fail", "Free space",
+        "%.0f GB here; the ISO takes 0.3 GB and the virtual disk grows as WinCraft OS fills it" % (free / 1e9))
+    mem, rec = host_memory_mb(), recommended()
+    if mem:
+        add("ok" if mem >= 6144 else "warn", "Memory",
+            "%.0f GB; the VM would get %.0f GB" % (mem / 1024, rec["mem"] / 1024))
+    if online:
+        try:
+            add("ok", "WinCraft OS releases", "the newest is %s" % github_release()["tag_name"].lstrip("v"))
+        except (urllib.error.URLError, OSError, ValueError, KeyError) as e:
+            add("warn", "WinCraft OS releases", "GitHub could not be reached (%s)" % getattr(e, "reason", e))
+    return found
+
+
+def cmd_doctor(a):
+    host = Host()
+    found = checks(host, online=not a.offline)
+    rec = recommended()
+    rec["graphics"] = "3d" if host.qemu and host.gl_problem is None else "basic"
+    ready = not any(c["level"] == "fail" for c in found)
+    if a.json:
+        say(json.dumps({"ready": ready, "checks": found, "recommended": rec}, indent=2))
+        return
+    say("WinCraft VM: checking this computer\n")
+    mark = {"ok": "✓", "warn": "!", "fail": "✗", "info": "-"}
+    for c in found:
+        say("  %s %s: %s" % (mark[c["level"]], c["what"], c["detail"]))
+        if c["fix"]:
+            say("      fix: %s" % c["fix"])
+    say("")
+    if ready:
+        say("Ready. Recommended settings: --mem %d --cpus %d --disk %d --graphics %s"
+            % (rec["mem"], rec["cpus"], rec["disk_gb"], rec["graphics"]))
+    else:
+        say("Not ready: fix what is marked ✗, then run ./wcvm doctor again.")
+        sys.exit(1)
+
+
+def cmd_setup(a):
+    host = need_qemu()
+    cfg = load_config(False)
+    first = cfg is None
+    if first:
+        cfg = dict(DEFAULTS, **recommended())
+        cfg["graphics"] = "3d" if host.gl_problem is None else "basic"
+    for key in ("mem", "cpus", "res", "graphics", "display", "firmware"):
+        value = getattr(a, key)
+        if value is not None:
+            try:
+                cfg[key] = SETTINGS[key][1](str(value))
+            except ValueError as e:
+                die("--%s: %s" % (key, e))
+    if a.disk is not None:
+        if os.path.exists(DISK):
+            die("the virtual disk exists already, with %d GB: its size cannot change "
+                "(./wcvm destroy deletes it)" % cfg["disk_gb"])
+        if not 8 <= a.disk <= 4096:
+            die("--disk: from 8 to 4096 GB")
+        cfg["disk_gb"] = a.disk
+    if cfg["graphics"] == "3d" and host.gl_problem:
+        say("No 3D graphics here (%s): the VM draws in software." % host.gl_problem)
+        cfg["graphics"] = "basic"
+    if cfg["display"] == "window" and not host.window:
+        say("No window is possible here: the VM runs without one.")
+        cfg["display"] = "headless"
+    if cfg["firmware"] == "uefi" and not host.uefi:
+        die("no UEFI firmware for QEMU here (%s); leave out --firmware for BIOS" % (hint("uefi") or "install OVMF"))
+
+    if a.iso:
+        try:
+            cfg["iso"] = _iso(a.iso)
+        except ValueError as e:
+            die("--iso: %s" % e)
+    elif a.version or not cfg["iso"] or not os.path.isfile(real_path(cfg["iso"])):
+        path, _ = download(a.version)
+        cfg["iso"] = stored_path(path)
+    if not os.path.exists(DISK):
+        create_disk(cfg, host)
+    save_config(cfg)
+    say("\nWinCraft VM is set up%s:" % ("" if first else " (settings updated)"))
+    say("  WinCraft OS %s, from %s" % (iso_version(cfg["iso"]) or "?", cfg["iso"]))
+    say("  %d MB of memory, %d processor cores, a virtual disk of %d GB (it takes only the space used)"
+        % (cfg["mem"], cfg["cpus"], cfg["disk_gb"]))
+    say("  %s graphics, %s, %s firmware" % ("3D" if cfg["graphics"] == "3d" else "basic",
+                                           "in a window" if cfg["display"] == "window" else "no window",
+                                           cfg["firmware"].upper()))
+    if not cfg["installed"]:
+        say("\nNext: ./wcvm install (or ./wcvm start --live to try it first, without installing)")
+
+
+def cmd_download(a):
+    cfg = load_config(False)
+    path, ver = download(a.version)
+    if cfg is not None and not a.keep:
+        cfg["iso"] = stored_path(path)
+        save_config(cfg)
+        say("The VM installs from, and starts live from, WinCraft OS %s now." % ver)
+
+
+def cmd_install(a, reinstall=False):
+    cfg = load_config()
+    host = need_qemu()
+    need_stopped()
+    if reinstall and not a.yes:
+        die("reinstall erases everything on the virtual disk: add --yes")
+    if cfg["installed"] and not reinstall:
+        die("WinCraft OS %s is installed on the virtual disk already; ./wcvm reinstall --yes "
+            "erases the disk and installs again" % cfg["installed_version"])
+    iso = need_iso(cfg)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,16}", a.name):
+        die("--name: up to 16 letters, digits, - and _")
+    if a.size and not 4096 <= a.size <= cfg["disk_gb"] * 1024:
+        die("--size: from 4096 MiB to the disk's %d MiB" % (cfg["disk_gb"] * 1024))
+    if a.window and not host.window:
+        die("no window is possible here; leave out --window")
+    if reinstall and os.path.exists(DISK):
+        # A blank disk, rather than the old one beside the ISO: the ISO's
+        # start-up would take its partitions, found by their labels, as its own.
+        os.unlink(DISK)
+        cfg.update(installed=False, installed_version="", snapshots={})
+        save_config(cfg)
+        say("The virtual disk was erased, with its snapshots.")
+    if not os.path.exists(DISK):
+        create_disk(cfg, host)
+
+    say("Starting WinCraft OS %s from its ISO%s..." % (iso_version(iso), " in a window" if a.window else ""))
+    p = launch(cfg, host, "window" if a.window else "headless", live=True)
+
+    def fail(msg):
+        shot = os.path.join(SHOTS, time.strftime("install-failed-%Y%m%d-%H%M%S.png"))
+        try:
+            os.makedirs(SHOTS, exist_ok=True)
+            q = QMP()
+            take_screenshot(q, shot)
+            q.cmd("quit")
+            msg += "\nThe VM's screen at that moment: %s" % shot
+        except (OSError, ValueError, SystemExit):
+            p.kill()
+        die(msg + "\nThe VM was powered off.")
+
+    if not wait_for(shell_up, boot_timeout(host), p):
+        fail("WinCraft OS did not start from the ISO (its shell never answered)")
+    out, ok, _ = serial_sh("test -e /run/wincraft/live && test -f /live/medium/wincraft/system.sfs && "
+                           "cat /etc/wincraft/version /sys/block/%s/size" % GUEST_DISK, 15)
+    fields = out.split()
+    if not ok or len(fields) != 2:
+        fail("the VM did not start from the ISO as expected: %s" % out.strip())
+    version = fields[0]
+    say("Installing WinCraft OS %s on the virtual disk (%d GB)..."
+        % (version, round((a.size * 1048576 if a.size else int(fields[1]) * 512) / 2**30)))
+    lines = guest_request("install", "%s %d %s" % (GUEST_DISK, a.size, a.name), 1800)
+    if lines[-1] != "done":
+        fail("the installer stopped: %s" % lines[-1])
+    cfg.update(installed=True, installed_version=version)
+    save_config(cfg)
+    say("Installed. Shutting the VM down...")
+    serial_sh("poweroff", 5)
+    try:
+        p.wait(120)
+    except subprocess.TimeoutExpired:
+        QMP().cmd("quit")
+        p.wait(20)
+    say("WinCraft OS %s is installed on the virtual disk. ./wcvm start starts it." % version)
+
+
+def cmd_start(a):
+    cfg = load_config()
+    host = need_qemu()
+    if vm_pid():
+        say("The VM is running already.")
+    else:
+        if not os.path.exists(DISK):
+            die("the virtual disk is missing: ./wcvm setup")
+        live = a.live or not cfg["installed"]
+        if live:
+            need_iso(cfg)
+        display = "headless" if a.headless else "window" if a.window else cfg["display"]
+        if display == "window" and not host.window:
+            say("No window is possible here: the VM starts without one.")
+            display = "headless"
+        # Live beside an installed disk, the ISO's start-up would take the
+        # disk's partitions, found by their labels, as its own: leave it out.
+        launch(cfg, host, display, live, disk=not (live and cfg["installed"]))
+        if live and not cfg["installed"]:
+            say("WinCraft OS is not installed yet: it starts live from its ISO, and nothing is kept "
+                "when it stops (./wcvm install installs it).")
+        elif live:
+            say("Starting live from the ISO, without the virtual disk: the installed system is left "
+                "alone, and nothing is kept.")
+        say("The VM is starting%s." % (" in a window" if display == "window" else ", without a window"))
+    if a.wait:
+        if not wait_for(desktop_up, boot_timeout(host)):
+            die("the desktop did not come up: ./wcvm screenshot shows the screen, and "
+                "./wcvm sh 'tail /run/log/desktop.log' the desktop's log once the shell answers")
+        say("WinCraft OS is up, with its desktop.")
+        remember(cfg, guest_info())
+        if cfg["share"]:
+            mount_share(cfg)
+
+
+def cmd_stop(a):
+    pid = vm_pid()
+    if not pid:
+        say("The VM is not running.")
+        return
+    if a.force:
+        try:
+            QMP().cmd("quit")
+        except (OSError, ValueError):
+            os.kill(pid, 15)
+        wait_gone(pid, 20)
+        say("The VM was powered off.")
+        return
+    info = guest_info()
+    if info is None:
+        die("the VM's shell does not answer: ./wcvm stop --force powers it off at once, like pulling the plug")
+    say("Shutting WinCraft OS down...")
+    if info.get("desktop") == "yes":
+        # as Start > Shut down does: every program may save its work first
+        serial_sh(AS_USER + "setsid /usr/lib/wincraft/end-session poweroff >/dev/null 2>&1 &", 10)
+    else:
+        serial_sh("poweroff", 5)
+    if wait_gone(pid, a.timeout):
+        say("The VM is off.")
+        return
+    die("WinCraft OS has not shut down after %d seconds: a program may be asking to save its work "
+        "(./wcvm screenshot shows it). ./wcvm stop --force powers it off at once." % a.timeout)
+
+
+def cmd_restart(a):
+    state = run_state()
+    if vm_pid():
+        a.force = False
+        cmd_stop(a)
+    a.live = bool(state.get("live"))
+    if not a.window and not a.headless and state.get("display"):
+        a.window, a.headless = state["display"] == "window", state["display"] == "headless"
+    cmd_start(a)
+
+
+def cmd_wait(a):
+    need_running()
+    check = desktop_up if a.what == "desktop" else shell_up
+    if not wait_for(check, a.timeout):
+        die("the %s is not up after %d seconds" % (a.what, a.timeout))
+    say("The %s is up." % a.what)
+
+
+def cmd_status(a):
+    cfg = load_config(False)
+    host = Host()
+    pid = vm_pid()
+    state = run_state() if pid else {}
+    info = guest_info(4) if pid else None
+    if cfg is not None:
+        remember(cfg, info)
+    snaps = sorted(cfg["snapshots"]) if cfg else []
+    st = {
+        "configured": cfg is not None,
+        "qemu": bool(host.qemu and host.qemu_img),
+        "running": bool(pid),
+        "settings": {k: cfg[k] for k in SETTINGS} if cfg else None,
+        "disk_gb": cfg["disk_gb"] if cfg else None,
+        "disk_used_gb": round(os.stat(DISK).st_blocks * 512 / 1e9, 1) if os.path.exists(DISK) else None,
+        "installed": cfg["installed"] if cfg else False,
+        "installed_version": cfg["installed_version"] if cfg else "",
+        "iso_version": iso_version(cfg["iso"]) if cfg else "",
+        "run": state or None,
+        "guest": info,
+        "snapshots": snaps,
+    }
+    if a.json:
+        say(json.dumps(st, indent=2))
+        return
+    if cfg is None:
+        say("WinCraft VM is not set up yet: ./wcvm doctor, then ./wcvm setup.")
+        if not st["qemu"]:
+            say("QEMU is not installed on this computer.")
+        return
+    say("WinCraft VM")
+    say("  system:   %s" % ("WinCraft OS %s, installed on the virtual disk" % cfg["installed_version"]
+                            if cfg["installed"] else "not installed yet (ISO: WinCraft OS %s)" % st["iso_version"]))
+    if pid:
+        how = "in a window" if state.get("display") == "window" else "without a window"
+        say("  running:  yes, %s, %s graphics%s%s" % (
+            how, "3D" if state.get("graphics") == "3d" else "basic",
+            ", live from the ISO (nothing is kept)" if state.get("live") else "",
+            ", without KVM (slow)" if state.get("accel") == "tcg" else ""))
+        if info:
+            say("  guest:    WinCraft OS %s, %s session, desktop %s, network %s, up %d min"
+                % (info.get("version", "?"), info.get("session"),
+                   "running" if info.get("desktop") == "yes" else "not running yet",
+                   info.get("ip") or "down", int(info.get("uptime") or 0) // 60))
+        else:
+            say("  guest:    starting (its shell does not answer yet)")
+    else:
+        say("  running:  no")
+    say("  settings: %d MB, %d cores, %s graphics, %s, %s" % (
+        cfg["mem"], cfg["cpus"], cfg["graphics"], cfg["display"], cfg["firmware"]))
+    if st["disk_used_gb"] is not None:
+        say("  disk:     %d GB, %.1f GB used on this computer" % (cfg["disk_gb"], st["disk_used_gb"]))
+    if cfg["share"]:
+        say("  shared:   %s as drive H:%s" % (cfg["share"], "" if cfg["share_writable"] else " (read only)"))
+    if snaps:
+        say("  snapshots: %s" % ", ".join(snaps))
+
+
+def cmd_screenshot(a):
+    need_running()
+    path = os.path.abspath(a.file) if a.file else \
+        os.path.join(SHOTS, time.strftime("screen-%Y%m%d-%H%M%S.png"))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    q = QMP()
+    take_screenshot(q, path)
+    q.close()
+    say("%s (%dx%d)" % (path, *png_size(path)))
+    old = sorted(glob.glob(os.path.join(SHOTS, "screen-*.png")))[:-30]
+    for f in old:
+        os.unlink(f)
+
+
+def cmd_sh(a):
+    need_shell()
+    command = " ".join(a.command)
+    if not command.strip():
+        die("which command?")
+    if a.user:
+        command = AS_USER + "sh -c " + shlex.quote(command)
+    out, ok, status = guest_run(command, a.timeout, interrupt=True)
+    if out:
+        say(out)
+    if not ok:
+        die("no answer after %d seconds: interrupted. Start long commands in the background "
+            "(setsid ... &), or give --timeout" % a.timeout, 124)
+    sys.exit(status)
+
+
+def cmd_push(a):
+    need_shell()
+    if not os.path.isfile(a.file):
+        die("no such file here: %s" % a.file)
+    dest = guest_path(a.dest)
+    out, _, _ = serial_sh("test -d %s && echo folder" % shlex.quote(dest), 10)
+    if dest.endswith("/") or out.strip() == "folder":
+        dest = dest.rstrip("/") + "/" + os.path.basename(a.file)
+    size = os.path.getsize(a.file)
+    qd = shlex.quote(dest)
+    # under the person's home, written as them, folders included
+    write = 'mkdir -p "$(dirname %s)" && cat > %s.part' % (qd, qd)
+    if dest.startswith("/home/user/"):
+        write = AS_USER + "sh -c " + shlex.quote(write)
+    q = QMP()
+    channel_write(q, a.file, "head -c %d | %s" % (size, write), timeout=max(60, size // 2000000))
+    q.close()
+    out, ok, status = serial_sh("[ \"$(stat -c %%s %s.part 2>/dev/null)\" = %d ] && mv %s.part %s"
+                                % (qd, size, qd, qd), 15)
+    if not ok or status:
+        serial_sh("rm -f %s.part" % qd, 10)
+        die("the copy did not arrive whole")
+    say("Copied to %s in the VM (%d bytes)." % (dest, size))
+
+
+def cmd_pull(a):
+    need_shell()
+    src = guest_path(a.src)
+    out, ok, status = serial_sh("stat -c %%s %s" % shlex.quote(src), 10)
+    if not ok or status or not out.strip().isdigit():
+        die("no such file in the VM: %s" % src)
+    size = int(out.strip())
+    dest = os.path.join(a.dest, os.path.basename(src)) if os.path.isdir(a.dest) else a.dest
+    q = QMP()
+    with open(dest + ".part", "wb") as f:
+        got = channel_read(q, "cat %s" % shlex.quote(src), size=size, sink=f,
+                           timeout=max(60, size // 2000000))
+    q.close()
+    if got != size:
+        os.unlink(dest + ".part")
+        die("the copy did not arrive whole (%d of %d bytes)" % (got, size))
+    os.replace(dest + ".part", dest)
+    say("Copied to %s (%d bytes)." % (os.path.abspath(dest), size))
+
+
+def cmd_input(a):
+    need_running()
+    q = QMP()
+    if a.cmd == "type":
+        type_text(q, a.text)
+    elif a.cmd == "key":
+        for combo in a.combos:
+            press(q, combo)
+    elif a.cmd == "move":
+        pointer(q, a.x, a.y)
+    elif a.cmd == "click":
+        click(q, a.x, a.y, a.button)
+    elif a.cmd == "dclick":
+        click(q, a.x, a.y, count=2)
+    q.close()
+
+
+def cmd_config(a):
+    cfg = load_config()
+    if not a.settings:
+        for key, (desc, _) in SETTINGS.items():
+            value = cfg[key]
+            shown = ("on" if value else "off") if isinstance(value, bool) else str(value) or "(none)"
+            say("  %-15s %-14s %s" % (key, shown, desc))
+        say("  %-15s %-14s %s" % ("disk_gb", cfg["disk_gb"], "the virtual disk's size (fixed when it is made)"))
+        say("\nChange with ./wcvm config KEY=VALUE; changes take effect at the next start.")
+        return
+    host = Host()
+    changes = {}
+    for item in a.settings:
+        key, sep, value = item.partition("=")
+        if not sep or key not in SETTINGS:
+            die("not a setting: %s (one of %s)" % (item, ", ".join(SETTINGS)))
+        try:
+            changes[key] = SETTINGS[key][1](value)
+        except ValueError as e:
+            die("%s: %s" % (key, e))
+    if changes.get("firmware") == "uefi" and not host.uefi:
+        die("no UEFI firmware for QEMU here (%s)" % (hint("uefi") or "install OVMF"))
+    if changes.get("graphics") == "3d" and host.gl_problem:
+        say("Note: no 3D graphics here (%s): the VM keeps drawing in software." % host.gl_problem)
+    if changes.get("display") == "window" and not host.window:
+        say("Note: no window is possible here: the VM keeps running without one.")
+    mem = host_memory_mb()
+    if "mem" in changes and mem and changes["mem"] > mem * 3 // 4:
+        say("Note: that is most of this computer's %d MB." % mem)
+    cfg.update(changes)
+    save_config(cfg)
+    for key, value in changes.items():
+        say("%s = %s" % (key, ("on" if value else "off") if isinstance(value, bool) else value or "(none)"))
+    if vm_pid():
+        say("The VM is running: this takes effect at its next start (./wcvm restart).")
+
+
+def cmd_share(a):
+    cfg = load_config()
+    if not cfg["share"]:
+        die("no shared folder: ./wcvm config share=FOLDER, then restart the VM")
+    need_shell()
+    out, _, _ = serial_sh("ls /sys/bus/virtio/drivers/9pnet_virtio/ 2>/dev/null | grep -c virtio", 10)
+    if out.strip() in ("", "0"):
+        die("the VM was started without the shared folder: restart it (./wcvm restart)")
+    mount_share(cfg)
+
+
+def qemu_img_snapshots(host):
+    r = subprocess.run([host.qemu_img, "snapshot", "-l", "-U", DISK], capture_output=True, text=True)
+    names = []
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) > 2 and parts[0].isdigit():
+            names.append(parts[1])
+    return names
+
+
+def cmd_snapshot(a):
+    cfg = load_config()
+    host = need_qemu()
+    if not os.path.exists(DISK):
+        die("there is no virtual disk")
+    names = qemu_img_snapshots(host)
+    if a.action == "list":
+        if not names:
+            say("No snapshots. ./wcvm snapshot save NAME takes one (with the VM stopped).")
+        for n in names:
+            meta = cfg["snapshots"].get(n, {})
+            what = ("WinCraft OS %s" % meta["version"] if meta.get("installed")
+                    else "before WinCraft OS was installed" if meta else "")
+            say("  %-20s %s  %s" % (n, meta.get("date", ""), what))
+        return
+    if not a.name or not re.fullmatch(r"[A-Za-z0-9._-]{1,40}", a.name):
+        die("a snapshot needs a name: letters, digits, '.', '-' and '_'")
+    need_stopped()
+    if a.action == "save":
+        if a.name in names:
+            die("there is a snapshot %s already" % a.name)
+        args = ["-c", a.name]
+    elif a.name not in names:
+        die("no snapshot %s (./wcvm snapshot list)" % a.name)
+    elif not a.yes:
+        die("%s: add --yes (%s)" % (a.action, "everything changed since the snapshot is lost"
+                                    if a.action == "restore" else "it cannot be undone"))
+    else:
+        args = ["-a" if a.action == "restore" else "-d", a.name]
+    r = subprocess.run([host.qemu_img, "snapshot"] + args + [DISK], capture_output=True, text=True)
+    if r.returncode:
+        die(r.stderr.strip())
+    if a.action == "save":
+        cfg["snapshots"][a.name] = {"date": time.strftime("%Y-%m-%d %H:%M"), "installed": cfg["installed"],
+                                    "version": cfg["installed_version"]}
+        say("Snapshot %s saved: ./wcvm snapshot restore %s --yes brings the disk back to now." % (a.name, a.name))
+    elif a.action == "restore":
+        meta = cfg["snapshots"].get(a.name)
+        if meta:
+            cfg.update(installed=meta["installed"], installed_version=meta["version"])
+        say("The virtual disk is back as it was at snapshot %s." % a.name)
+    else:
+        cfg["snapshots"].pop(a.name, None)
+        say("Snapshot %s deleted." % a.name)
+    save_config(cfg)
+
+
+def cmd_update(a):
+    cfg = load_config()
+    need_shell()
+    info = guest_info(10) or {}
+    if info.get("session") != "installed":
+        die("this session runs live from the ISO: there is nothing to update. "
+            "Install WinCraft OS, or start a newer ISO (./wcvm download)")
+    lines = guest_request("update", "check", 120, show=False)
+    if lines[-1].startswith("error: "):
+        die(lines[-1][7:])
+    found = dict(line.split(" ", 1) for line in lines if " " in line)
+    installed, latest = found.get("installed", "?"), found.get("latest", "")
+    if a.action == "check":
+        say("WinCraft OS %s is installed; the newest release is %s." % (installed, latest or "unknown"))
+        if found.get("next"):
+            say("WinCraft OS %s is installed for the next start." % found["next"])
+        if found.get("previous"):
+            say("%s is kept as the previous version%s." % (found["previous"], ", offered in the boot menu"
+                                                          if found.get("previous-boot") == "yes" else ""))
+        if latest and latest != installed and found.get("next") != latest:
+            say("An update is available: ./wcvm update install")
+        return
+    if a.action == "install":
+        if found.get("next") == latest:
+            say("WinCraft OS %s is installed already and starts at the next start (./wcvm restart)." % latest)
+            return
+        if not latest or latest == installed:
+            say("WinCraft OS %s is the newest release: nothing to do." % installed)
+            return
+        say("Updating WinCraft OS %s to %s (a download of about 270 MB, inside the VM)..." % (installed, latest))
+        args = "install " + latest
+    else:
+        if not found.get("previous"):
+            die("there is no previous version to go back to")
+        say("Going back to WinCraft OS %s at the next start..." % found["previous"])
+        args = "previous"
+    lines = guest_request("update", args, 3600)
+    if lines[-1] != "done":
+        die(lines[-1][7:] if lines[-1].startswith("error: ") else lines[-1])
+    say("Done: it takes effect when the VM restarts (./wcvm restart).")
+
+
+def cmd_logs(a):
+    path = os.path.join(RUN, "qemu.log" if a.which == "qemu" else "serial.log")
+    text = tail(path, a.lines)
+    # the serial log holds the terminal's control sequences
+    say(re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b[()][A-Z0-9]|[\x00-\x08\x0e-\x1f]", "", text) or "(empty)")
+
+
+def cmd_destroy(a):
+    need_stopped()
+    if not os.path.isdir(MACHINE):
+        say("There is no VM to delete.")
+        return
+    if not a.yes:
+        die("destroy deletes the virtual disk, with everything installed in the VM, and its settings: add --yes")
+    if a.all:
+        shutil.rmtree(MACHINE, ignore_errors=True)
+        say("The VM and its downloads are deleted.")
+        return
+    for path in (DISK, CONFIG, VARS):
+        if os.path.exists(path):
+            os.unlink(path)
+    for d in (RUN, SHOTS, CACHE):
+        shutil.rmtree(d, ignore_errors=True)
+    say("The VM is deleted; the downloads are kept (./wcvm setup starts again).")
+
+
+def describe(cfg, pid, state):
+    """The VM's state in a few lines, for Claude at the start of a session."""
+    if cfg is None:
+        host = Host()
+        return ("WinCraft VM state: NOT SET UP - this is the first launch%s. As soon as the person "
+                "writes anything (even just hello), greet them in a sentence or two and guide them "
+                "through the setup: follow the `setup` skill."
+                % ("" if host.qemu else ", and QEMU is not installed on this computer"))
+    lines = ["WinCraft VM state: set up."]
+    lines.append("WinCraft OS %s is installed on the virtual disk." % cfg["installed_version"] if cfg["installed"]
+                 else "WinCraft OS is NOT installed yet (ISO: WinCraft OS %s): offer to install it "
+                      "(the `setup` skill, from its install step)." % (iso_version(cfg["iso"]) or "?"))
+    if pid:
+        lines.append("The VM is running%s%s." % (" in a window" if state.get("display") == "window" else
+                                                 " without a window",
+                                                 ", live from the ISO" if state.get("live") else ""))
+    else:
+        lines.append("The VM is stopped.")
+    lines.append("Settings: %d MB, %d cores, %s graphics, %s, %s firmware%s." % (
+        cfg["mem"], cfg["cpus"], cfg["graphics"], cfg["display"], cfg["firmware"],
+        ", shared folder %s" % cfg["share"] if cfg["share"] else ""))
+    return " ".join(lines)
+
+
+def cmd_hook(a):
+    """SessionStart hook for Claude Code: the state as context, and a
+    welcome for the person the first time."""
+    try:
+        source = "startup" if sys.stdin.isatty() else json.load(sys.stdin).get("source", "startup")
+    except (ValueError, AttributeError):
+        source = "startup"
+    cfg = load_config(False)
+    pid = vm_pid()
+    out = {"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                  "additionalContext": describe(cfg, pid, run_state() if pid else {})}}
+    if cfg is None and source == "startup":
+        out["systemMessage"] = ("Welcome to WinCraft VM. Nothing is set up yet: say hello, and Claude will "
+                                "check this computer, then install WinCraft OS in a virtual machine for you.")
+    say(json.dumps(out))
+
+
+def cmd_statusline(a):
+    """Claude Code's status line: one line, quickly (no question to the VM)."""
+    if not sys.stdin.isatty():
+        sys.stdin.read()
+    cfg = load_config(False)
+    if cfg is None:
+        say("WinCraft VM · not set up yet")
+        return
+    pid = vm_pid()
+    state = run_state() if pid else {}
+    running = "\033[32m● running\033[0m" + (" live" if state.get("live") else "") if pid else "\033[2m○ stopped\033[0m"
+    system = "WinCraft OS %s" % cfg["installed_version"] if cfg["installed"] else "not installed"
+    say("WinCraft VM %s · %s · %g GB · %d cores" % (running, system, cfg["mem"] / 1024, cfg["cpus"]))
+
+
+def main():
+    p = argparse.ArgumentParser(prog="wcvm", description="The WinCraft OS virtual machine of this folder.",
+                                formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
+
+    s = sub.add_parser("doctor", help="can this computer run the VM?")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--offline", action="store_true", help="do not ask GitHub for the newest release")
+    s.set_defaults(func=cmd_doctor)
+
+    s = sub.add_parser("setup", help="settings, download, virtual disk")
+    s.add_argument("--mem", type=int)
+    s.add_argument("--cpus", type=int)
+    s.add_argument("--disk", type=int, help="the virtual disk's size, GB")
+    s.add_argument("--res")
+    s.add_argument("--graphics", choices=["3d", "basic"])
+    s.add_argument("--display", choices=["window", "headless"])
+    s.add_argument("--firmware", choices=["bios", "uefi"])
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--iso", help="a WinCraft OS ISO of this computer instead of a download")
+    g.add_argument("--version", help="this release instead of the newest")
+    s.set_defaults(func=cmd_setup)
+
+    s = sub.add_parser("download", help="a WinCraft OS ISO, checked")
+    s.add_argument("--version")
+    s.add_argument("--keep", action="store_true", help="keep the VM's ISO setting as it is")
+    s.set_defaults(func=cmd_download)
+
+    for name in ("install", "reinstall"):
+        s = sub.add_parser(name, help="install WinCraft OS on the virtual disk" if name == "install"
+                           else "erase the virtual disk and install again")
+        s.add_argument("--size", type=int, default=0, help="MiB for WinCraft (default: the whole disk)")
+        s.add_argument("--name", default="WINCRAFT_DATA", help="the data partition's label")
+        s.add_argument("--window", action="store_true", help="show the VM while it installs")
+        s.add_argument("--yes", action="store_true")
+        s.set_defaults(func=(lambda a: cmd_install(a, reinstall=True)) if name == "reinstall" else cmd_install)
+
+    for name in ("start", "restart"):
+        s = sub.add_parser(name, help="start the VM" if name == "start" else "shut down and start again")
+        g = s.add_mutually_exclusive_group()
+        g.add_argument("--window", action="store_true")
+        g.add_argument("--headless", action="store_true")
+        if name == "start":
+            s.add_argument("--live", action="store_true", help="from the ISO, leaving the disk alone")
+        s.add_argument("--wait", action="store_true", help="until the desktop is up")
+        if name == "restart":
+            s.add_argument("--timeout", type=int, default=120, help="for the shutdown")
+        s.set_defaults(func=cmd_start if name == "start" else cmd_restart)
+
+    s = sub.add_parser("stop", help="shut the VM down")
+    s.add_argument("--force", action="store_true", help="power off at once")
+    s.add_argument("--timeout", type=int, default=120)
+    s.set_defaults(func=cmd_stop)
+
+    s = sub.add_parser("wait", help="until the shell or the desktop is up")
+    s.add_argument("what", nargs="?", choices=["shell", "desktop"], default="desktop")
+    s.add_argument("--timeout", type=int, default=300)
+    s.set_defaults(func=cmd_wait)
+
+    s = sub.add_parser("status", help="the VM's state")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("screenshot", help="the VM's screen as PNG")
+    s.add_argument("file", nargs="?")
+    s.set_defaults(func=cmd_screenshot)
+
+    s = sub.add_parser("sh", help="run a command in the VM")
+    s.add_argument("--user", action="store_true", help="as the person, with their desktop's environment")
+    s.add_argument("--timeout", type=int, default=60)
+    s.add_argument("command", nargs=argparse.REMAINDER)
+    s.set_defaults(func=cmd_sh)
+
+    s = sub.add_parser("push", help="copy a file into the VM")
+    s.add_argument("file")
+    s.add_argument("dest")
+    s.set_defaults(func=cmd_push)
+
+    s = sub.add_parser("pull", help="copy a file out of the VM")
+    s.add_argument("src")
+    s.add_argument("dest")
+    s.set_defaults(func=cmd_pull)
+
+    s = sub.add_parser("type", help="type text")
+    s.add_argument("text")
+    s.set_defaults(func=cmd_input)
+    s = sub.add_parser("key", help="press keys, e.g. ctrl-alt-delete")
+    s.add_argument("combos", nargs="+")
+    s.set_defaults(func=cmd_input)
+    for name in ("move", "click", "dclick"):
+        s = sub.add_parser(name, help="the pointer, in screenshot pixels")
+        s.add_argument("x", type=int)
+        s.add_argument("y", type=int)
+        if name == "click":
+            s.add_argument("button", nargs="?", choices=["left", "right", "middle"], default="left")
+        s.set_defaults(func=cmd_input)
+
+    s = sub.add_parser("config", help="show or change settings")
+    s.add_argument("settings", nargs="*", metavar="KEY=VALUE")
+    s.set_defaults(func=cmd_config)
+
+    s = sub.add_parser("share", help="mount the shared folder now")
+    s.set_defaults(func=cmd_share)
+
+    s = sub.add_parser("snapshot", help="snapshots of the virtual disk")
+    s.add_argument("action", nargs="?", choices=["list", "save", "restore", "delete"], default="list")
+    s.add_argument("name", nargs="?")
+    s.add_argument("--yes", action="store_true")
+    s.set_defaults(func=cmd_snapshot)
+
+    s = sub.add_parser("update", help="WinCraft OS's updater, in the VM")
+    s.add_argument("action", nargs="?", choices=["check", "install", "previous"], default="check")
+    s.set_defaults(func=cmd_update)
+
+    s = sub.add_parser("logs", help="QEMU's output, or the transcript of the VM's serial shell")
+    s.add_argument("which", nargs="?", choices=["qemu", "serial"], default="qemu")
+    s.add_argument("-n", "--lines", type=int, default=40)
+    s.set_defaults(func=cmd_logs)
+
+    s = sub.add_parser("destroy", help="delete the VM")
+    s.add_argument("--yes", action="store_true")
+    s.add_argument("--all", action="store_true", help="the downloads too")
+    s.set_defaults(func=cmd_destroy)
+
+    s = sub.add_parser("hook")
+    s.add_argument("event", choices=["session-start"])
+    s.set_defaults(func=cmd_hook)
+    s = sub.add_parser("statusline")
+    s.set_defaults(func=cmd_statusline)
+
+    a = p.parse_args()
+    if not a.cmd:
+        p.print_help()
+        return
+    try:
+        a.func(a)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

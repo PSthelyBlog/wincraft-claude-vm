@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./wcvm:*)"
+    ],
+    "ask": [
+      "Bash(./wcvm reinstall:*)",
+      "Bash(./wcvm destroy:*)",
+      "Bash(./wcvm snapshot restore:*)",
+      "Bash(./wcvm snapshot delete:*)",
+      "Bash(./wcvm stop --force:*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/wcvm hook session-start"
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "./wcvm statusline"
+  }
+}

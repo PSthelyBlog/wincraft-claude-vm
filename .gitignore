@@ -1,0 +1,3 @@
+# the virtual machine: its disk, settings, downloads and run-time files
+/machine/
+__pycache__/

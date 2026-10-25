@@ -1,0 +1,11 @@
+#!/bin/sh
+# wincraft-vm - open WinCraft VM: Claude Code, in this folder, runs the VM.
+# The first time, Claude starts the setup at once.
+cd "$(dirname "$0")" || exit 1
+if ! command -v claude >/dev/null 2>&1; then
+    echo "WinCraft VM is run by Claude Code, which is not installed here:" >&2
+    echo "  https://claude.com/claude-code" >&2
+    exit 1
+fi
+[ -f machine/config.json ] || exec claude "$@" "Hello! Please set up WinCraft OS on this computer."
+exec claude "$@"
