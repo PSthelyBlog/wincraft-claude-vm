@@ -12,7 +12,8 @@ You need Linux on an x86-64 computer, Claude Code and Python 3.8 or newer.
 QEMU too, but Claude checks for it and tells you how to install it.
 
 ```
-cd wincraft-vm
+git clone https://github.com/PSthelyBlog/wincraft-claude-vm.git
+cd wincraft-claude-vm
 ./wincraft-vm          # or simply: claude
 ```
 
@@ -97,3 +98,9 @@ deletes those too. Deleting this folder deletes everything.
   (Claude knows).
 - WinCraft OS's own limits are in its
   [README](https://github.com/PSthelyBlog/wincraft#what-it-is-not).
+
+## License
+
+MIT (see `LICENSE`). WinCraft OS, which the VM downloads and runs, has its
+own licenses, listed in its
+[README](https://github.com/PSthelyBlog/wincraft#license).
