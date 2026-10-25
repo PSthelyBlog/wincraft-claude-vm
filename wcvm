@@ -100,7 +100,11 @@ DEFAULTS = {
 
 
 def say(*args):
-    print(*args, flush=True)
+    try:
+        print(*args, flush=True)
+    except BrokenPipeError:
+        # the reader went away (| head): finish the job without output
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
 
 
 def die(msg, code=1):
